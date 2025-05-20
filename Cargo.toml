@@ -10,6 +10,7 @@ hex = "0.4.3"
 hmac = "0.12.1"
 ipinfo = "3.1.1"
 rand = "0.9.1"
+reqwest = { version = "0.12.15", features = ["blocking"] }
 scrypt = "0.11.0"
 sha1 = "0.10.6"
 tokio = { version = "1.45.0", features = ["full"] }
