@@ -51,7 +51,35 @@ impl Server {
         self.usuarios.insert(nome.to_string(), usuario);
         println!("[Server] Usuario '{}' cadastrado com sucesso", nome);
     }
+    fn autenticar(&self, nome: &str, senha: &str) -> bool {
+        match self.usuarios.get(nome) {
+            Some(user) => {
+                let params = scrypt::Params::recommended();
+                let mut output = [0u8; 64];
+                let result = scrypt(senha.as_bytes(), &user.salt, &params, &mut output);
 
+                match result {
+                    Ok(_) => {
+                        let hash_matches = output == user.hash.as_slice();
+                        if hash_matches {
+                            println!("[Server] Autenticação bem-sucedida para '{}'", nome);
+                        } else {
+                            println!("[Server] Falha na autenticação: hash não confere.");
+                        }
+                        hash_matches
+                    }
+                    Err(_) => {
+                        println!("[Server] Erro ao gerar hash na autenticação.");
+                        false
+                    }
+                }
+            }
+            None => {
+                println!("[Server] Usuário '{}' não encontrado.", nome);
+                false
+            }
+        }
+    }
     fn receber_mensagem(
         &self,
         nome: &str,
@@ -60,7 +88,10 @@ impl Server {
         nonce: &[u8],
         cifrado: &[u8],
     ) {
-        println!("[Server] Recebendo mensagem do usuario '{}', pais: {}, TOTP: {}", nome, pais_obtido, totp);
+        println!(
+            "[Server] Recebendo mensagem do usuario '{}', pais: {}, TOTP: {}",
+            nome, pais_obtido, totp
+        );
         println!("[Server] Nonce recebido: {:02x?}", nonce);
         println!("[Server] Mensagem cifrada recebida: {:02x?}", cifrado);
 
@@ -91,6 +122,17 @@ impl Server {
             Err(_) => println!("falha na decifragem"), // em producao logaria isso com cuidado
         };
     }
+
+    fn listar_usuarios(&self) {
+        println!("\n[Server] Lista de usuários cadastrados:");
+        if self.usuarios.is_empty() {
+            println!("Nenhum usuário cadastrado.");
+        } else {
+            for (nome, usuario) in &self.usuarios {
+                println!("-> {} ({})", nome, usuario.pais);
+            }
+        }
+    }
 }
 
 struct Client {
@@ -109,31 +151,16 @@ impl Client {
         }
     }
 
-    async fn obter_ip(&self, token: &str) -> String {
-        // em producao o uso de ipinfo precisa respeitar limites de api
-        println!("[Client] Obtendo IP publico");
+    async fn obter_pais(&self, token: &str) -> String {
+        println!("[Client] Obtendo pais usando IP publico");
+
         let config = IpInfoConfig {
             token: Some(token.to_string()),
             ..Default::default()
         };
         let mut cliente = IpInfo::new(config).unwrap();
         let detalhes = cliente.lookup_self_v4().await.unwrap();
-        println!("[Client] IP publico obtido: {}", detalhes.ip);
-        detalhes.ip
-    }
-    async fn obter_pais(&self, token: &str, maybe_ip: Option<String>) -> String {
-        // em producao o uso de ipinfo precisa respeitar limites de api
-        let ip = match maybe_ip {
-            Some(ip) => ip,
-            None => self.obter_ip(token).await,
-        };
-        println!("[Client] Obtendo pais para IP: {}", ip);
-        let config = IpInfoConfig {
-            token: Some(token.to_string()),
-            ..Default::default()
-        };
-        let mut cliente = IpInfo::new(config).unwrap();
-        let detalhes = cliente.lookup(&ip).await.unwrap();
+
         println!("[Client] Pais obtido: {}", detalhes.country);
         detalhes.country
     }
@@ -146,7 +173,10 @@ impl Client {
             .unwrap()
             .as_secs();
         let contador = time / intervalo;
-        println!("[Client] Tempo atual em segundos: {}, contador TOTP: {}", time, contador);
+        println!(
+            "[Client] Tempo atual em segundos: {}, contador TOTP: {}",
+            time, contador
+        );
         let contador_bytes = contador.to_be_bytes();
         let mut mac = <HmacSha1 as Mac>::new_from_slice(&self.secret_totp).unwrap();
         mac.update(&contador_bytes);
@@ -162,7 +192,10 @@ impl Client {
     }
 
     fn cifrar_mensagem(&self, totp: &str, salt: &[u8], mensagem: &str) -> (Vec<u8>, Vec<u8>) {
-        println!("[Client] Cifrando mensagem: '{}', com TOTP: {}", mensagem, totp);
+        println!(
+            "[Client] Cifrando mensagem: '{}', com TOTP: {}",
+            mensagem, totp
+        );
         let chave = derive_key(totp, salt);
         println!("[Client] Chave derivada para cifra: {:02x?}", chave);
         let cifra = Aes256Gcm::new_from_slice(&chave).unwrap();
@@ -178,41 +211,118 @@ impl Client {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{self, Write};
+
     dotenv::dotenv().ok();
 
-    let nome_usuario = env::var("USER_NAME").unwrap_or("carla".to_string());
-    let senha = env::var("USER_PASSWORD").expect("USER_PASSWORD not set");
     let token_ipinfo = env::var("IPINFO_TOKEN").expect("IPINFO_TOKEN not set");
     let secret_totp = env::var("TOTP_SECRET").expect("TOTP_SECRET not set");
 
-    // em producao usaria ip publico obtido por um serviço confiavel tipo whatismyip
-    let args: Vec<String> = env::args().collect();
-    let mut ip_manual = None;
-    if args.len() > 2 && args[1] == "--ip" {
-        ip_manual = Some(args[2].clone());
+    let mut servidor = Server::new();
+    let mut logged_user: Option<(String, Client, String)> = None;
+
+    // test user
+    let nome_teste = "teste";
+    let senha_teste = "1234";
+    let pais_teste = "US";
+    let (hash_hex, salt_hex) = hash_password(senha_teste.to_string());
+
+    let user_teste = User {
+        nome: nome_teste.to_string(),
+        pais: pais_teste.to_string(),
+        hash: hex::decode(hash_hex).unwrap(),
+        salt: hex::decode(salt_hex).unwrap(),
+        telefone: None,
+    };
+
+    servidor.usuarios.insert(nome_teste.to_string(), user_teste);
+    println!(
+        "[Setup] Usuário de teste '{}' criado com país '{}'",
+        nome_teste, pais_teste
+    );
+
+    loop {
+        println!("\n--- Menu ---");
+        println!("1. Criar usuário");
+        println!("2. Login");
+        println!("3. Enviar mensagem");
+        println!("4. Listar usuários");
+        println!("5. Sair");
+
+        print!("Escolha uma opção: ");
+        io::stdout().flush()?;
+        let mut opcao = String::new();
+        io::stdin().read_line(&mut opcao)?;
+        let opcao = opcao.trim();
+
+        match opcao {
+            "1" => {
+                // Criar usuário
+                println!("Nome de usuário:");
+                let mut nome = String::new();
+                io::stdin().read_line(&mut nome)?;
+                let nome = nome.trim().to_string();
+
+                println!("Senha:");
+                let mut senha = String::new();
+                io::stdin().read_line(&mut senha)?;
+                let senha = senha.trim().to_string();
+
+                let cliente =
+                    Client::novo(nome.clone(), senha.clone(), secret_totp.as_bytes().to_vec());
+                let pais = cliente.obter_pais(&token_ipinfo).await;
+                servidor.cadastrar(&nome, &pais, &senha, None);
+                println!("Usuário criado com sucesso!");
+            }
+            "2" => {
+                // Login
+                println!("Nome de usuário:");
+                let mut nome = String::new();
+                io::stdin().read_line(&mut nome)?;
+                let nome = nome.trim().to_string();
+
+                println!("Senha:");
+                let mut senha = String::new();
+                io::stdin().read_line(&mut senha)?;
+                let senha = senha.trim().to_string();
+
+                if servidor.autenticar(&nome, &senha) {
+                    let cliente =
+                        Client::novo(nome.clone(), senha.clone(), secret_totp.as_bytes().to_vec());
+                    logged_user = Some((nome.clone(), cliente, senha.clone()));
+                    println!("Login bem-sucedido.");
+                } else {
+                    println!("Credenciais inválidas.");
+                }
+            }
+            "3" => {
+                // Enviar mensagem
+                if let Some((nome, cliente, _senha)) = &logged_user {
+                    println!("Mensagem:");
+                    let mut mensagem = String::new();
+                    io::stdin().read_line(&mut mensagem)?;
+                    let mensagem = mensagem.trim().to_string();
+                    let pais = cliente.obter_pais(&token_ipinfo).await;
+                    let totp = cliente.gerar_totp();
+                    let user_info = servidor.usuarios.get(nome).unwrap();
+
+                    let (nonce, cipher) =
+                        cliente.cifrar_mensagem(&totp, &user_info.salt, &mensagem);
+
+                    servidor.receber_mensagem(nome, &pais, &totp, &nonce, &cipher);
+                } else {
+                    println!("Você precisa estar logado para enviar mensagens.");
+                }
+            }
+            "4" => {
+                // Listar usuários
+                servidor.listar_usuarios();
+            }
+            "5" => break,
+            _ => println!("Opção inválida."),
+        }
     }
 
-    let cliente = Client::novo(
-        nome_usuario.clone(),
-        senha.clone(),
-        secret_totp.as_bytes().to_vec(),
-    );
-    let pais = cliente.obter_pais(&token_ipinfo, ip_manual).await;
-
-    let mut servidor = Server::new();
-    servidor.cadastrar(&nome_usuario, &pais, &senha, None);
-
-    println!("iniciando autenticacao 3fa");
-
-    let totp_codigo = cliente.gerar_totp();
-    let user_info = servidor.usuarios.get(&nome_usuario).unwrap();
-    let (nonce, cipher) = cliente.cifrar_mensagem(
-        &totp_codigo,
-        &user_info.salt,
-        "mensagem segura para o servidor",
-    );
-
-    servidor.receber_mensagem(&nome_usuario, &pais, &totp_codigo, &nonce, &cipher);
     Ok(())
 }
 
@@ -231,6 +341,9 @@ fn derive_key(segredo: &str, salt: &[u8]) -> Vec<u8> {
     let params = Params::recommended();
     let mut chave = [0u8; 32];
     scrypt(segredo.as_bytes(), salt, &params, &mut chave).unwrap();
-    println!("[Utils] Chave derivada com segredo '{}': {:02x?}", segredo, chave);
+    println!(
+        "[Utils] Chave derivada com segredo '{}': {:02x?}",
+        segredo, chave
+    );
     chave.to_vec()
 }
